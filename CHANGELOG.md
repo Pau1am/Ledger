@@ -14,7 +14,8 @@ relative to upstream.
   2.9 us per row - the gap was Exposed's `update { id inList ... }` building an IN list
   of thousands of elements element by element, not SQLite. The text is now built once
   per size and cached, with parameters bound through JDBC. Same SQL, same predicate,
-  same rows. Flag write 493 ms -> 37 ms (13x); rollback overall 1.26 s -> 0.32 s.
+  same rows. Within a single run the flag write went 493 ms -> 37 ms (13x), which is
+  a same-process comparison and therefore trustworthy.
 - **Idle SQLite connection held open (largest remaining win).** SQLite checkpoints
   and deletes the `-wal` file whenever the last connection to a WAL database closes.
   Ledger opens a new connection per transaction, so every transaction paid for a
@@ -57,10 +58,38 @@ runs, fresh terrain each time):
 
 | | before optimisations | current |
 |---|---|---|
-| rollback (13,500) | 2.295 s | **0.323 s** |
 | drain window | 4.22 s | 3.17 s |
 | drain rate | 3,203 rows/s | **4,270 rows/s** |
 | bytes per row | 181.4 | **167.2** |
+| rollback (13,500) | see note | see note |
+
+### Note on rollback measurements
+
+Earlier revisions of this file claimed rollback going from 2.295 s to 0.323 s (~7x).
+That claim does not survive a paired measurement and has been withdrawn.
+
+The benchmark runs on a shared Windows machine whose throughput drifts by several
+times over hours. Cross-build numbers taken hours apart are therefore not comparable:
+the identical jar that measured 0.333 s at one point measured 1.22-1.32 s later, and a
+byte-comparison of the two builds showed every class the same size with only metadata
+differences - i.e. the code was not the variable, the machine was. Sequentially
+measuring A and then B conflates the change with that drift.
+
+Measuring instead by alternating the two builds in the same window (5 pairs) gives:
+
+| pair | this branch | upstream 1.3.24 |
+|---|---|---|
+| 1 | 0.379 s | 0.951 s |
+| 2 | 0.293 s | 0.339 s |
+| 3 | 0.387 s | 0.360 s |
+| 4 | 0.319 s | 0.308 s |
+| 5 | 0.333 s | 0.302 s |
+
+Medians 0.333 s vs 0.339 s: rollback is at least as fast as upstream and noticeably
+less variable, but the earlier large multiple was an artefact. The database-level
+improvements are real and were measured within single runs (flag write 493 -> 37 ms;
+write window 1.53 -> 0.62 s of real work); they reduce CPU work and tick pressure
+rather than dominating the wall clock.
 
 The drain window contains a fixed 3.0 s settle detector, so the write work behind it
 went from about 1.72 s to 0.17 s. For reference, CoreProtect 24.1 (DuckDB) on the
