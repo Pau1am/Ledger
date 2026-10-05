@@ -9,6 +9,12 @@ relative to upstream.
 
 ### Changed since reopt.2
 
+- **Rolled-back flag written through one cached JDBC statement.** The flag write cost
+  36 us per row on the live server while the identical UPDATE executed directly takes
+  2.9 us per row - the gap was Exposed's `update { id inList ... }` building an IN list
+  of thousands of elements element by element, not SQLite. The text is now built once
+  per size and cached, with parameters bound through JDBC. Same SQL, same predicate,
+  same rows. Flag write 493 ms -> 37 ms (13x); rollback overall 1.26 s -> 0.32 s.
 - **Idle SQLite connection held open (largest remaining win).** SQLite checkpoints
   and deletes the `-wal` file whenever the last connection to a WAL database closes.
   Ledger opens a new connection per transaction, so every transaction paid for a
@@ -51,9 +57,9 @@ runs, fresh terrain each time):
 
 | | before optimisations | current |
 |---|---|---|
-| rollback (13,500) | 4.25 s | **1.26 s** |
-| drain window | 4.52 s | 3.17 s |
-| drain rate | 2,860 rows/s | **4,256 rows/s** |
+| rollback (13,500) | 2.295 s | **0.323 s** |
+| drain window | 4.22 s | 3.17 s |
+| drain rate | 3,203 rows/s | **4,270 rows/s** |
 | bytes per row | 181.4 | **167.2** |
 
 The drain window contains a fixed 3.0 s settle detector, so the write work behind it
