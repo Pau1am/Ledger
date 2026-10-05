@@ -9,6 +9,22 @@ relative to upstream.
 
 ### Changed since reopt.2
 
+- **Idle SQLite connection held open (largest remaining win).** SQLite checkpoints
+  and deletes the `-wal` file whenever the last connection to a WAL database closes.
+  Ledger opens a new connection per transaction, so every transaction paid for a
+  full WAL teardown: measured, 11 transactions cost 642 ms that way versus 58 ms
+  with one idle connection held open (11x). Profiling a rollback showed this as
+  ~720 ms hidden outside the SQL itself - the `rolled_back` UPDATEs timed 339 ms
+  while the surrounding call measured 1061 ms. The pragma count is not the cause
+  (0 vs 7 pragmas: 54 vs 88 ms); it is the WAL lifecycle. One connection is now kept
+  open for the process lifetime, released at shutdown. Transactions are acquired
+  exactly as before - Exposed still gets a fresh connection each time and the anchor
+  never runs a statement. Only applied when Ledger created the SQLite datasource
+  itself; a user-supplied DataSource is left alone so a small pool cannot be starved.
+  If the anchor cannot be opened the plugin logs and continues on the previous
+  behaviour.
+
+
 - **Real JDBC batch insert (ingest).** Exposed's `batchInsert` was issuing one
   statement per row - a 13,500-action burst produced 13,500 individual
   `INSERT INTO actions` statements. On the same schema and rows a genuine JDBC
@@ -33,14 +49,16 @@ relative to upstream.
 Combined effect on a 13,500-action workload against reopt.1 (medians of three
 runs, fresh terrain each time):
 
-| | reopt.1 | reopt.3 |
+| | before optimisations | current |
 |---|---|---|
-| drain window | 4.534 s | 3.622 s |
-| drain rate | 2,977 rows/s | 3,727 rows/s |
-| rollback | 4.01 s | 2.01 s |
+| rollback (13,500) | 4.25 s | **1.26 s** |
+| drain window | 4.52 s | 3.17 s |
+| drain rate | 2,860 rows/s | **4,256 rows/s** |
+| bytes per row | 181.4 | **167.2** |
 
-The drain window contains a fixed 3.0 s settle detector, so the write work behind
-it went from about 1.53 s to 0.62 s.
+The drain window contains a fixed 3.0 s settle detector, so the write work behind it
+went from about 1.72 s to 0.17 s. For reference, CoreProtect 24.1 (DuckDB) on the
+same workload: rollback 0.21 s, 107.7 bytes per row.
 
 ### Evaluated and rejected (measured, not assumed)
 
