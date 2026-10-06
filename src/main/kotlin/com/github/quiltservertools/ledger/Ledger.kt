@@ -91,6 +91,7 @@ object Ledger : DedicatedServerModInitializer, CoroutineScope {
         ExtensionManager.serverStarting(server)
         DatabaseManager.setup(ExtensionManager.getDataSource())
         DatabaseManager.ensureTables()
+        DatabaseManager.keepWarmConnection()
 
         ActionRegistry.registerDefaultTypes()
         initListeners()
@@ -129,6 +130,10 @@ object Ledger : DedicatedServerModInitializer, CoroutineScope {
                     }
                     ActionQueueService.drainAll()
                     logInfo("Successfully drained database queue")
+                    // Release the idle anchor before the world directory is closed, so no
+                    // open file handle is left behind (Windows cannot rename or delete an
+                    // open file).
+                    DatabaseManager.closeWarmConnection()
                 }
             } catch (e: TimeoutCancellationException) {
                 logWarn(
