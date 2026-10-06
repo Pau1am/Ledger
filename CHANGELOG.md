@@ -48,10 +48,18 @@ relative to upstream.
   being flooded), and returns to the configured cadence as soon as a pass comes up
   short. Trickle traffic still batches exactly as before; an idle server does not
   become one transaction per action.
-- **Rollback/restore batch size 1,000 -> 5,000 rows.** Fewer read and commit round
-  trips for the same undo: 3.86/4.16 s became 1.99/2.03 s on a 13,500-block
-  rollback (about 2x). Zero "can't keep up" warnings at either setting, so this
-  does not cost responsiveness - the per-tick budget still yields mid-batch.
+- **Rollback/restore batch size 1,000 -> 50,000 rows.** The batch size was measured
+  as its own variable rather than assumed. An earlier revision of this file raised it
+  to 5,000 believing fewer round trips must be better; that was wrong in an
+  expensive way. On a 13,500-action rollback a 5,000 batch took 1.236 s (three reads
+  plus three flag transactions) while reading the whole set in one batch took
+  0.326 s - 3.8x faster. Each transaction carries a large fixed cost beyond the SQL
+  itself (dispatch through the single database context, plus commit), so transaction
+  *count* dominates, not rows per transaction. Paired against upstream, which does no
+  batching at all, 5,000 was 39% slower on rollback; a single batch is within 8%.
+  Kept as a bound rather than removed so one huge rollback cannot materialise
+  millions of actions, but at 50,000 a typical rollback is one round trip. Zero
+  "can't keep up" warnings at every size tested.
 
 Combined effect on a 13,500-action workload against reopt.1 (medians of three
 runs, fresh terrain each time):

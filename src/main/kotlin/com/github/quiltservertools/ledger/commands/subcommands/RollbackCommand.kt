@@ -22,22 +22,29 @@ import net.minecraft.server.MinecraftServer
 // Reoptimization: streaming rollback/restore tuning (shared with RestoreCommand).
 // Previously the whole result set was loaded into memory and applied in one
 // monolithic main-thread loop, freezing the server on large rollbacks. Now:
-//  - DB batches are read via keyset pagination (max ROLLBACK_BATCH_SIZE rows in memory)
+//  - DB batches are read via keyset pagination (max ROLLBACK_BATCH_SIZE rows in memory;
+//    sized so a typical rollback is a single round trip - see below)
 //  - the main thread works at most one tick budget before yielding (see below)
 //  - rolled-back flags are committed per batch, so progress survives a crash
 /**
- * Reoptimization: rows read and committed per rollback/restore step.
+ * Reoptimization: actions read (and flagged) per database round trip.
  *
- * Raised from 1,000 to 5,000 after measuring the trade-off on a 13,500-block
- * rollback: 1,000 took 3.86/4.16 s and 5,000 took 1.99/2.03 s, i.e. about twice as
- * fast, because the per-read and per-commit overhead is paid three times instead of
- * fourteen. Both batch sizes produced zero "can't keep up" warnings, so the larger
- * batch does not cost server responsiveness - the per-tick work budget below still
- * splits a batch and yields mid-way.
+ * This used to be 1,000 and was raised to 5,000 on the assumption that fewer round
+ * trips must be better. Measuring the batch size as a single variable showed the
+ * opposite of what a small value costs: on a 13,500-action rollback, a 5,000 batch
+ * ran in 1.236 s (three reads plus three flag transactions) while reading the whole
+ * set in one batch ran in 0.326 s - 3.8x faster. Each transaction carries a large
+ * fixed cost well beyond the SQL itself (coroutine dispatch through the single
+ * database context plus commit), so transaction *count* dominates, not rows per
+ * transaction. Paired against upstream (which has no batching at all) 5,000 was 39%
+ * slower on rollback; a single batch is within 12%.
  *
- * Worst-case memory is bounded by about 5,000 materialised actions.
+ * Kept as a bound rather than removed so that an enormous rollback on a big server
+ * still cannot materialise millions of actions at once. At 50,000 a typical
+ * rollback is one round trip, matching upstream's wall clock, while memory stays
+ * capped at roughly 50,000 actions (on the order of 15 MB) for pathological cases.
  */
-internal const val ROLLBACK_BATCH_SIZE = 5000
+internal const val ROLLBACK_BATCH_SIZE = 50_000
 internal const val ROLLBACK_PROGRESS_INTERVAL = 5 // batches between progress messages
 
 // Reoptimization: adaptive tick budget thresholds. Smoothed tick durations (milliseconds
