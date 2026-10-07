@@ -2,6 +2,7 @@ package com.github.quiltservertools.ledger.commands
 
 import com.github.quiltservertools.ledger.api.ExtensionManager
 import com.github.quiltservertools.ledger.commands.subcommands.CompactCommand
+import com.github.quiltservertools.ledger.commands.subcommands.ExportLegacyCommand
 import com.github.quiltservertools.ledger.commands.subcommands.InspectCommand
 import com.github.quiltservertools.ledger.commands.subcommands.PageCommand
 import com.github.quiltservertools.ledger.commands.subcommands.PlayerCommand
@@ -54,6 +55,10 @@ fun registerCommands(dispatcher: Dispatcher) {
 
     // Reoptimization: migrate legacy text block states to dictionary encoding + vacuum
     rootNode.addChild(CompactCommand.build())
+
+    // Reoptimization: the reverse direction - materialise the legacy text columns so an
+    // unmodified upstream build can read this database (see ExportLegacyCommand).
+    rootNode.addChild(ExportLegacyCommand.build())
 
     rootNode.addChild(PlayerCommand.build())
 

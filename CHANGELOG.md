@@ -9,6 +9,31 @@ relative to upstream.
 
 ### Changed since reopt.2
 
+- **`extra_data` is dictionary-encoded, content-addressed and compressed.** This is the
+  field upstream PR #291 was right to target: it holds serialised NBT for container
+  contents and entity kills, and on a real server it is the largest column. Values of 32
+  characters or more now go into an `extra_data_dict` table keyed by a 128-bit content
+  hash, so a lookup is one index probe and never reads the payload; short values stay
+  inline so they remain readable by unmodified upstream builds. Measured on real
+  Minecraft entity NBT from a live server: 587-624 bytes raw became 438-450 bytes
+  stored - 72-75%, a 27% saving on the largest field.
+  Two design points differ from PR #291 on purpose. The compression floor is 92 bytes,
+  not 920: every NBT value in that measurement was under 920 characters, so PR #291's
+  threshold would have compressed none of them and its per-row gzip flag would have been
+  dead weight. And the header byte inside the payload records whether it is compressed,
+  which avoids a whole extra column per dictionary row to store one bit.
+  Schema changes stay additive - one nullable column plus one new table - and the new
+  column is created unconditionally at startup with the same instant ALTER path as
+  `block_state_ref`, so no opt-in flag is needed.
+- **`/ledger exportlegacy` restores the legacy text columns.** Rows this fork writes
+  populate only the `*_ref` columns, because storing both forms on every row would cost
+  exactly the bytes the dictionary saves. Unmodified upstream Ledger does not know about
+  those columns and would read NULL, so this command materialises the text again on
+  demand; afterwards an upstream build sees a complete database. Verified byte-identical
+  against the dictionary contents. This turns database compatibility into a one-time,
+  opt-in cost instead of a permanent one.
+- **Idle SQLite connection held open
+
 - **Rolled-back flag written through one cached JDBC statement.** The flag write cost
   36 us per row on the live server while the identical UPDATE executed directly takes
   2.9 us per row - the gap was Exposed's `update { id inList ... }` building an IN list

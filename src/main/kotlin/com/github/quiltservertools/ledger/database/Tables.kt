@@ -15,6 +15,23 @@ private const val MAX_IDENTIFIER_LENGTH = 191
 private const val MAX_SOURCE_NAME_LENGTH = 30
 private const val MAX_BLOCK_STATE_LENGTH = 500
 
+/**
+ * Reoptimization: size of the content hash used as the dictionary key.
+ *
+ * 16 bytes = 128 bits. A 64-bit hash would collide with probability ~1 in 10^5 across
+ * 20 million entries, which is too high to treat as impossible; 128 bits is ~10^-21.
+ */
+private const val EXTRA_DATA_HASH_LENGTH = 16
+
+/**
+ * Reoptimization: upper bound on a stored `extra_data` payload.
+ *
+ * 65535 is the ceiling for MySQL BLOB/TEXT, and Ledger supports MySQL via the
+ * Ledger Databases extension, so a value larger than this is left inline rather than
+ * failing the insert on that backend. gzip is applied before this cap is checked.
+ */
+private const val MAX_EXTRA_DATA_PAYLOAD_LENGTH = 65535
+
 object Tables {
     object Players : IntIdTable("players") {
         val playerId = uuid("player_id").uniqueIndex()
@@ -69,6 +86,31 @@ object Tables {
         companion object : IntEntityClass<BlockState>(BlockStates)
     }
 
+    /**
+     * Reoptimization: content-addressed dictionary for long `extra_data` values.
+     *
+     * `extra_data` holds serialised NBT - container contents and entity kills - and on a
+     * real server it is the single largest field, which is also what upstream PR #291
+     * identified. Values are deduplicated by a 128-bit content hash rather than by
+     * comparing the payload, so a lookup is one index probe and never reads the blob.
+     *
+     * 128 bits rather than 64: a 64-bit hash collides about 1 in 10^5 across 20 million
+     * dictionary entries, which is too likely to treat as impossible; 128 bits puts it
+     * around 10^-21. (PR #291 used a 32-bit Java hashCode plus a payload comparison.)
+     *
+     * `payload` is the value's UTF-8 bytes, optionally gzip-compressed, prefixed by one
+     * header byte recording which. That avoids PR #291's separate `gzip` column - a
+     * whole extra column per dictionary row to store one bit.
+     */
+    object ExtraDataDict : IntIdTable("extra_data_dict") {
+        val hash = binary("content_hash", EXTRA_DATA_HASH_LENGTH).uniqueIndex()
+        val payload = binary("payload", MAX_EXTRA_DATA_PAYLOAD_LENGTH)
+    }
+
+    /**
+     * Reoptimization: reference into [ExtraDataDict] for rows whose `extra_data` is long
+     * enough to be worth deduplicating, see [Actions.extraDataRef].
+     */
     object Actions : IntIdTable("actions") {
         val actionIdentifier = reference("action_id", ActionIdentifiers.id).index()
         val timestamp = timestamp("time")
@@ -100,6 +142,7 @@ object Tables {
         val sourceName = reference("source", Sources.id).index()
         val sourcePlayer = optReference("player_id", Players.id).index()
         val extraData = text("extra_data").nullable()
+        val extraDataRef = integer("extra_data_ref").nullable()
         val rolledBack = bool("rolled_back").clientDefault { false }
 
         init {

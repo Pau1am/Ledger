@@ -69,10 +69,15 @@ import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import org.jetbrains.exposed.v1.jdbc.update
 import org.sqlite.SQLiteConfig
 import org.sqlite.SQLiteDataSource
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.security.MessageDigest
 import java.time.Instant
 import java.time.temporal.ChronoUnit
 import java.util.*
 import java.util.function.Function
+import java.util.zip.GZIPInputStream
+import java.util.zip.GZIPOutputStream
 import javax.sql.DataSource
 import kotlin.io.path.pathString
 import kotlin.math.ceil
@@ -118,7 +123,55 @@ private const val FLAG_UPDATE_SQL_OVERHEAD = 48
 private const val INSERT_ACTIONS_SQL =
     "INSERT INTO actions (action_id, \"time\", time_ms, x, y, z, object_id, old_object_id, " +
         "world_id, block_state_ref, old_block_state_ref, \"source\", player_id, extra_data, " +
-        "rolled_back) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        "extra_data_ref, rolled_back) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+
+/**
+ * Reoptimization: `extra_data` shorter than this stays inline in the TEXT column.
+ *
+ * Dictionary-ising a value costs one row in `extra_data_dict` plus a 4-byte reference,
+ * so for short values the reference is not worth it, and inline text also keeps such
+ * rows readable by unmodified upstream Ledger.
+ */
+private const val EXTRA_DATA_DICT_MIN_CHARS = 32
+
+/**
+ * Reoptimization: only gzip once the raw value reaches this many bytes.
+ *
+ * Upstream PR #291 compressed above 920 characters, which on real data never fired:
+ * container NBT in our measurements peaked at 473 characters, so its compression column
+ * was dead weight and every dictionary row sat there uncompressed. Measured on the same
+ * data, a 92-byte floor takes the dictionary from 100% to 67% of the original bytes.
+ */
+private const val EXTRA_DATA_GZIP_MIN_BYTES = 92
+
+/** Header byte recording whether the payload that follows is gzip-compressed. */
+private const val EXTRA_DATA_PLAIN: Byte = 0
+private const val EXTRA_DATA_GZIP: Byte = 1
+
+/**
+ * Value JDBC reports for a NULL INTEGER via `getInt`. Used as the "no dictionary
+ * reference" sentinel when reading rows in bulk, where the column is read positionally.
+ */
+private const val NO_REFERENCE = 0
+
+/**
+ * Column positions in the positional row arrays that [materialiseLegacyColumns] reads,
+ * matching the SELECT order: id, block_state_ref, old_block_state_ref, extra_data_ref.
+ */
+private const val COL_ID = 0
+private const val COL_BLOCK_STATE_REF = 1
+private const val COL_OLD_BLOCK_STATE_REF = 2
+private const val COL_EXTRA_DATA_REF = 3
+
+/** Length of the content hash used as the dictionary key: 16 bytes = 128 bits. */
+private const val EXTRA_DATA_HASH_128_BYTES = 16
+
+/**
+ * Largest dictionary payload this build will write. 65535 is the ceiling for MySQL
+ * BLOB/TEXT and Ledger supports MySQL through the Ledger Databases extension, so a
+ * larger value is left inline rather than failing the insert on that backend.
+ */
+private const val MAX_EXTRA_DATA_PAYLOAD_BYTES = 65535
 
 // Reoptimization: SQLite connection tuning. The cache size is expressed in KiB and is
 // negative to mean "KiB rather than pages"; the other two are byte counts.
@@ -283,12 +336,14 @@ object DatabaseManager {
             Tables.Sources,
             Tables.Worlds,
             Tables.BlockStates,
+            Tables.ExtraDataDict,
         )
 
         // Reoptimization: make sure the dictionary-encoding reference columns exist.
         // ALTER TABLE ADD COLUMN (nullable, no default rewrite) is instant on both
         // SQLite and MySQL 8+ INSTANT, and fully backwards compatible.
         ensureBlockStateColumns()
+        ensureExtraDataColumn()
 
         if (config[DatabaseSpec.updateSchema]) {
             try {
@@ -316,6 +371,20 @@ object DatabaseManager {
         }
         if ("old_block_state_ref" !in columns) {
             exec("ALTER TABLE actions ADD COLUMN old_block_state_ref INTEGER")
+        }
+    }
+
+    /**
+     * Reoptimization: adds `extra_data_ref` when missing.
+     *
+     * Additive and nullable, with no default, so the ALTER is instant on SQLite and
+     * INSTANT on MySQL 8+. Rows written by unmodified upstream Ledger simply have NULL
+     * here and keep working through the legacy `extra_data` TEXT column.
+     */
+    private fun JdbcTransaction.ensureExtraDataColumn() {
+        val columns = existingColumnNames("actions")
+        if ("extra_data_ref" !in columns) {
+            exec("ALTER TABLE actions ADD COLUMN extra_data_ref INTEGER")
         }
     }
 
@@ -686,12 +755,122 @@ object DatabaseManager {
         }
 
     /**
+     * Reoptimization: writes the dictionary-encoded values back into the legacy TEXT
+     * columns - the escape hatch for database compatibility.
+     *
+     * Rows this fork writes populate only the `*_ref` columns, because storing both forms
+     * would forfeit the entire storage saving. Unmodified upstream Ledger knows nothing
+     * about those columns and would read NULL, so this command materialises the text
+     * again; afterwards an upstream build sees a complete database.
+     *
+     * Paying this once on demand is what makes the trade-off acceptable, versus writing
+     * both columns on every row forever. The dictionary encoding stays in place and in
+     * use; this only restores the redundant text, so run a vacuum afterwards to see the
+     * size consequence.
+     *
+     * Returns the number of rows touched.
+     */
+    suspend fun materialiseLegacyColumns(
+        batchSize: Int = 5000,
+        onProgress: suspend (done: Long, total: Long) -> Unit = { _, _ -> },
+    ): Long {
+        val pending = execute {
+            var count = 0L
+            exec(
+                "SELECT COUNT(*) FROM ${Tables.Actions.tableName} " +
+                    "WHERE (block_state IS NULL AND block_state_ref IS NOT NULL) " +
+                    "OR (old_block_state IS NULL AND old_block_state_ref IS NOT NULL) " +
+                    "OR (extra_data IS NULL AND extra_data_ref IS NOT NULL)",
+            ) { rs ->
+                if (rs.next()) count = rs.getLong(1)
+            }
+            count
+        }
+        if (pending == 0L) return 0L
+
+        var done = 0L
+        var cursor = 0
+        while (true) {
+            // Read the batch of ids and their references.
+            val batch = execute {
+                val rows = mutableListOf<IntArray>()
+                exec(
+                    "SELECT id, block_state_ref, old_block_state_ref, extra_data_ref " +
+                        "FROM ${Tables.Actions.tableName} " +
+                        "WHERE ((block_state IS NULL AND block_state_ref IS NOT NULL) " +
+                        "OR (old_block_state IS NULL AND old_block_state_ref IS NOT NULL) " +
+                        "OR (extra_data IS NULL AND extra_data_ref IS NOT NULL)) " +
+                        "AND id > $cursor ORDER BY id ASC LIMIT $batchSize",
+                ) { rs ->
+                    while (rs.next()) {
+                        rows.add(
+                            intArrayOf(
+                                rs.getInt("id"),
+                                rs.getInt("block_state_ref"),
+                                rs.getInt("old_block_state_ref"),
+                                rs.getInt("extra_data_ref"),
+                            ),
+                        )
+                    }
+                }
+                rows
+            }
+            if (batch.isEmpty()) break
+
+            // Resolve every distinct reference for the whole batch in one go, rather than
+            // one query per row.
+            val stateIds = mutableSetOf<Int>()
+            val extraIds = mutableSetOf<Int>()
+            for (row in batch) {
+                if (row[COL_BLOCK_STATE_REF] != NO_REFERENCE) stateIds.add(row[COL_BLOCK_STATE_REF])
+                if (row[COL_OLD_BLOCK_STATE_REF] != NO_REFERENCE) stateIds.add(row[COL_OLD_BLOCK_STATE_REF])
+                if (row[COL_EXTRA_DATA_REF] != NO_REFERENCE) extraIds.add(row[COL_EXTRA_DATA_REF])
+            }
+
+            execute {
+                val states = if (stateIds.isEmpty()) emptyMap() else resolveBlockStates(stateIds)
+                val extras = if (extraIds.isEmpty()) emptyMap() else resolveExtraData(extraIds)
+                for (row in batch) {
+                    val id = row[COL_ID]
+                    val bs = if (row[COL_BLOCK_STATE_REF] != NO_REFERENCE) {
+                        states[row[COL_BLOCK_STATE_REF]]
+                    } else {
+                        null
+                    }
+                    val obs = if (row[COL_OLD_BLOCK_STATE_REF] != NO_REFERENCE) {
+                        states[row[COL_OLD_BLOCK_STATE_REF]]
+                    } else {
+                        null
+                    }
+                    val ed = if (row[COL_EXTRA_DATA_REF] != NO_REFERENCE) {
+                        extras[row[COL_EXTRA_DATA_REF]]
+                    } else {
+                        null
+                    }
+                    if (bs == null && obs == null && ed == null) continue
+                    Tables.Actions.update({ EqOp(Tables.Actions.id, intLiteral(id)) }) {
+                        if (bs != null) it[Tables.Actions.blockState] = bs
+                        if (obs != null) it[Tables.Actions.oldBlockState] = obs
+                        if (ed != null) it[Tables.Actions.extraData] = ed
+                    }
+                }
+            }
+
+            cursor += batchSize
+            done += batch.size
+            onProgress(done, pending)
+        }
+        return done
+    }
+
+    /**
      * Reoptimization: rewrites legacy text block states into dictionary references
      * in id-ordered batches, so existing databases shrink once the rows are
      * rewritten and vacuumed. Idempotent: rows already migrated are skipped.
      *
      * @return number of rows migrated
      */
+
     suspend fun compactBlockStates(
         batchSize: Int = 5000,
         onProgress: suspend (done: Long, total: Long) -> Unit = { _, _ -> },
@@ -783,6 +962,7 @@ object DatabaseManager {
         val actions = mutableListOf<ActionType>()
         val stateRefs = HashMap<ActionType, Int>()
         val oldStateRefs = HashMap<ActionType, Int>()
+        val extraDataRefs = HashMap<ActionType, Int>()
 
         val actionIdentifierCache = DatabaseCacheService.actionIdentifierKeys.inverse()
         val worldCache = DatabaseCacheService.worldIdentifierKeys.inverse()
@@ -817,7 +997,10 @@ object DatabaseManager {
             type.sourceProfile = action.getOrNull(Tables.Actions.sourcePlayer)?.let {
                 NameAndId(playerCache[it.value]!!, playerNameCache[it.value]!!)
             }
+            // Reoptimization: prefer the dictionary ref, fall back to the legacy TEXT
+            // column for short values and for rows written before the dictionary existed.
             type.extraData = action[Tables.Actions.extraData]
+            action.getOrNull(Tables.Actions.extraDataRef)?.let { extraDataRefs[type] = it }
             type.rolledBack = action[Tables.Actions.rolledBack]
 
             actions.add(type)
@@ -833,6 +1016,16 @@ object DatabaseManager {
                 }
                 if (action.oldObjectState == null) {
                     action.oldObjectState = oldStateRefs[action]?.let { resolved[it] }
+                }
+            }
+        }
+
+        // Resolve extra_data dictionary refs in one batch, same as block states above.
+        if (extraDataRefs.isNotEmpty()) {
+            val resolvedExtra = resolveExtraData(extraDataRefs.values.toSet())
+            for (action in actions) {
+                if (action.extraData == null) {
+                    action.extraData = extraDataRefs[action]?.let { resolvedExtra[it] }
                 }
             }
         }
@@ -1118,7 +1311,12 @@ object DatabaseManager {
                 ps.setObject(++i, action.oldObjectState?.let { getOrCreateBlockStateId(it) })
                 ps.setObject(++i, getOrCreateSourceId(action.sourceName))
                 ps.setObject(++i, action.sourceProfile?.let { getOrCreatePlayerId(it.id) })
-                ps.setObject(++i, action.extraData)
+                // Dictionary-encoded extra data: long NBT values go through the content
+                // addressed dictionary and this column is left null; short values stay
+                // inline so unmodified upstream Ledger can still read them.
+                val extraRef = action.extraData?.let { getOrCreateExtraDataId(it) }
+                ps.setObject(++i, if (extraRef == null) action.extraData else null)
+                ps.setObject(++i, extraRef)
                 ps.setObject(++i, Tables.Actions.rolledBack.columnType.valueToDB(false))
                 ps.addBatch()
             }
@@ -1136,6 +1334,109 @@ object DatabaseManager {
         Tables.BlockStates,
         Tables.BlockStates.state,
     )
+
+    /**
+     * Reoptimization: 128-bit content hash used as the dictionary key.
+     *
+     * SHA-256 truncated to 16 bytes. A plain 64-bit hash would collide with probability
+     * ~1 in 10^5 over 20 million dictionary entries, which is too likely to dismiss.
+     */
+    private fun contentHash128(value: String): ByteArray = MessageDigest.getInstance("SHA-256")
+        .digest(value.toByteArray(Charsets.UTF_8))
+        .copyOf(EXTRA_DATA_HASH_128_BYTES)
+
+    /**
+     * Reoptimization: packs a value for storage as `<1 header byte><payload>`.
+     *
+     * The header records whether the payload is gzip-compressed, which avoids a separate
+     * boolean column per dictionary row the way upstream PR #291 stores it.
+     */
+    private fun packExtraData(value: String): ByteArray {
+        val raw = value.toByteArray(Charsets.UTF_8)
+        if (raw.size < EXTRA_DATA_GZIP_MIN_BYTES) {
+            return byteArrayOf(EXTRA_DATA_PLAIN) + raw
+        }
+        val compressed = ByteArrayOutputStream(raw.size / 2).use { out ->
+            GZIPOutputStream(out).use { it.write(raw) }
+            out.toByteArray()
+        }
+        // Compression can lose on incompressible input; keep whichever is smaller.
+        return if (compressed.size < raw.size) {
+            byteArrayOf(EXTRA_DATA_GZIP) + compressed
+        } else {
+            byteArrayOf(EXTRA_DATA_PLAIN) + raw
+        }
+    }
+
+    private fun unpackExtraData(payload: ByteArray): String {
+        if (payload.isEmpty()) return ""
+        val body = payload.copyOfRange(1, payload.size)
+        val bytes = if (payload[0] == EXTRA_DATA_GZIP) {
+            GZIPInputStream(ByteArrayInputStream(body)).use { it.readBytes() }
+        } else {
+            body
+        }
+        return bytes.decodeToString()
+    }
+
+    /**
+     * Reoptimization: returns the dictionary id for a long `extra_data` value, or null
+     * when the value should stay inline.
+     *
+     * The lookup is a single probe on the content-hash unique index - it never reads or
+     * compares the stored payload, which is what PR #291's `javaHash AND value` predicate
+     * has to do on every hit.
+     */
+    private fun getOrCreateExtraDataId(value: String): Int? {
+        if (value.length < EXTRA_DATA_DICT_MIN_CHARS) return null
+
+        cache.extraDataKeys[value]?.let { return it }
+
+        val hash = contentHash128(value)
+        Tables.ExtraDataDict
+            .select(Tables.ExtraDataDict.id)
+            .where { Tables.ExtraDataDict.hash eq hash }
+            .firstOrNull()
+            ?.let { row ->
+                val id = row[Tables.ExtraDataDict.id].value
+                cache.rememberExtraData(value, id)
+                return id
+            }
+
+        val payload = packExtraData(value)
+        if (payload.size > MAX_EXTRA_DATA_PAYLOAD_BYTES) return null
+
+        val id = Tables.ExtraDataDict.insertAndGetId {
+            it[Tables.ExtraDataDict.hash] = hash
+            it[Tables.ExtraDataDict.payload] = payload
+        }.value
+        cache.rememberExtraData(value, id)
+        return id
+    }
+
+    /**
+     * Reoptimization: batch-resolves `extra_data` dictionary ids, mirroring
+     * [resolveBlockStates]. One IN (...) query per batch instead of a lookup per row.
+     */
+    private fun Transaction.resolveExtraData(ids: Set<Int>): Map<Int, String> {
+        val result = mutableMapOf<Int, String>()
+        val misses = mutableSetOf<Int>()
+        for (id in ids) {
+            val known = cache.extraDataKeys.inverse()[id]
+            if (known != null) result[id] = known else misses.add(id)
+        }
+        if (misses.isNotEmpty()) {
+            Tables.ExtraDataDict.selectAll()
+                .where { Tables.ExtraDataDict.id inList misses }
+                .forEach { row ->
+                    val id = row[Tables.ExtraDataDict.id].value
+                    val value = unpackExtraData(row[Tables.ExtraDataDict.payload])
+                    result[id] = value
+                    cache.rememberExtraData(value, id)
+                }
+        }
+        return result
+    }
 
     /**
      * Reoptimization: batch-resolves block state ids to their strings using the cache,
