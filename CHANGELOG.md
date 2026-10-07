@@ -1,13 +1,11 @@
 # Changelog
 
-## 1.3.25-reopt.1 (2026-10-05)
+## 1.3.25-reopt.2 (2026-10-07)
 
 Reoptimization pass over upstream Ledger 1.3.25 for MC 26.3 Fabric.
-This entry describes the current version. Changes introduced since reopt.1 are
-listed first, followed by a cumulative summary of everything this build carries
-relative to upstream.
+This entry covers what changed since reopt.1. Earlier releases follow below.
 
-### Changed since reopt.2
+### Changed in this release
 
 - **`extra_data` is dictionary-encoded, content-addressed and compressed.** This is the
   field upstream PR #291 was right to target: it holds serialised NBT for container
@@ -106,6 +104,71 @@ runs, fresh terrain each time):
 | bytes per row | 181.4 | **167.2** |
 | rollback (13,500) | see note | see note |
 
+### Verification (reopt.2)
+
+Live MC 26.3 Fabric server, two paths because they exercise different code:
+
+- **Fresh database.** 4 armed-zombie kills written: 4 actions, 4 dictionary rows, all
+  gzip-compressed, `extra_data` NULL on every row as intended. `/ledger exportlegacy`
+  then restored all four, and the restored strings matched the dictionary contents by
+  SHA-256.
+- **Upgrade in place** (what operators actually do). A world written by reopt.1 - which
+  stores `extra_data` inline and dictionary-encodes only block states - was opened by
+  reopt.2. The `extra_data_ref` column was added, no rows were lost, the old rows stayed
+  readable through search, and new kills went through the dictionary.
+  `/ledger exportlegacy` then restored 2,500 block-state rows whose text matched the
+  dictionary byte for byte, with the references left in place.
+- Zero exceptions and zero tick warnings on both paths.
+
+### Migration
+
+Schema changes are additive: one nullable column plus one new table, created by the same
+instant ALTER path as `block_state_ref`. Upgrading needs no configuration change and no
+manual step, and an existing world directory works as-is.
+
+## 1.3.25-reopt.1 (2026-10-05)
+
+First reoptimization release: integer time index, block-state dictionary,
+write-path work, and the rollback measurements.
+
+### Changed in this release
+
+- **Integer time index (main storage win).** `actions.time` stores TEXT
+  (`'2026-10-05 13:22:21.702'`, ~23 bytes). An index over that key cost ~35 bytes
+  per row - measured at 19.6% of the entire database, the largest non-table object.
+  A new `time_ms` column holds the same instant as epoch milliseconds and carries
+  the index instead:
+  - time index: **35.5 -> 16.4 B/row (-54%)**
+  - whole database, like-for-like (both fresh, neither vacuumed):
+    **181.44 -> 167.2 B/row (-7.9%)**
+  - an independent 500,000-row synthetic measurement reproduces -53% index size and
+    -11.5% file size
+  Note on the two sizes: running `/ledger compact` after the migration reclaims the
+  pages the dropped index leaves on the freelist, which takes an existing database
+  down by roughly 12%. Part of that comes from VACUUM itself - which any index-drop
+  would also produce - so the honest attribution for this change is the -7.9%
+  like-for-like figure above.
+  The TEXT column is kept and written alongside, so display strings and any external
+  tooling reading `time` are unaffected.
+- **Automatic, resumable migration.** On startup the column is added, indexed and
+  backfilled in id-ordered batches; once no sentinel values remain the superseded
+  TEXT index is dropped. Every value is verified to be an exact millisecond match for
+  its TEXT source, distinct counts are preserved, and no rows are lost
+  (`bench/test_time_migration.py`, 8/8 checks). If a backfill cannot finish, queries
+  transparently fall back to the TEXT column, so a partially migrated database still
+  returns correct results. With `updateSchema = false` the migration does not run at
+  all and the plugin stays on the original schema.
+- **SQLite connection tuning.** `temp_store=MEMORY`, 16 MiB page cache, 256 MiB
+  `mmap_size`, 64 MiB `journal_size_limit`, applied through `SQLiteConfig` so they
+  reach every pooled connection. Verified applied via JDBC, not assumed.
+- **Adaptive rollback/restore tick budget.** The fixed 25 ms budget is replaced by one
+  derived from the server's smoothed tick time (35 ms idle, 5 ms when ticks are already
+  at capacity). Scope note: on an idle benchmark server this changes nothing
+  measurable - a rollback was measured completing with zero yields, so the budget was
+  never its bottleneck. The benefit is on a loaded server, which a benchmark cannot
+  show. A previously recorded claim that a large share of rollback wall time went into
+  `delay(1)` was wrong and has been removed from the source comments.
+
 ### Note on rollback measurements
 
 Earlier revisions of this file claimed rollback going from 2.295 s to 0.323 s (~7x).
@@ -154,45 +217,7 @@ same workload: rollback 0.21 s, 107.7 bytes per row.
   databases, that trade is not worth 13% of disk under a
   stability-first priority. `time_ms` already makes `time` redundant for querying.
 
-### Changed since reopt.1
-
-- **Integer time index (main storage win).** `actions.time` stores TEXT
-  (`'2026-10-05 13:22:21.702'`, ~23 bytes). An index over that key cost ~35 bytes
-  per row - measured at 19.6% of the entire database, the largest non-table object.
-  A new `time_ms` column holds the same instant as epoch milliseconds and carries
-  the index instead:
-  - time index: **35.5 -> 16.4 B/row (-54%)**
-  - whole database, like-for-like (both fresh, neither vacuumed):
-    **181.44 -> 167.2 B/row (-7.9%)**
-  - an independent 500,000-row synthetic measurement reproduces -53% index size and
-    -11.5% file size
-  Note on the two sizes: running `/ledger compact` after the migration reclaims the
-  pages the dropped index leaves on the freelist, which takes an existing database
-  down by roughly 12%. Part of that comes from VACUUM itself - which any index-drop
-  would also produce - so the honest attribution for this change is the -7.9%
-  like-for-like figure above.
-  The TEXT column is kept and written alongside, so display strings and any external
-  tooling reading `time` are unaffected.
-- **Automatic, resumable migration.** On startup the column is added, indexed and
-  backfilled in id-ordered batches; once no sentinel values remain the superseded
-  TEXT index is dropped. Every value is verified to be an exact millisecond match for
-  its TEXT source, distinct counts are preserved, and no rows are lost
-  (`bench/test_time_migration.py`, 8/8 checks). If a backfill cannot finish, queries
-  transparently fall back to the TEXT column, so a partially migrated database still
-  returns correct results. With `updateSchema = false` the migration does not run at
-  all and the plugin stays on the original schema.
-- **SQLite connection tuning.** `temp_store=MEMORY`, 16 MiB page cache, 256 MiB
-  `mmap_size`, 64 MiB `journal_size_limit`, applied through `SQLiteConfig` so they
-  reach every pooled connection. Verified applied via JDBC, not assumed.
-- **Adaptive rollback/restore tick budget.** The fixed 25 ms budget is replaced by one
-  derived from the server's smoothed tick time (35 ms idle, 5 ms when ticks are already
-  at capacity). Scope note: on an idle benchmark server this changes nothing
-  measurable - a rollback was measured completing with zero yields, so the budget was
-  never its bottleneck. The benefit is on a loaded server, which a benchmark cannot
-  show. A previously recorded claim that a large share of rollback wall time went into
-  `delay(1)` was wrong and has been removed from the source comments.
-
-### Evaluated and rejected
+### Evaluated and rejected (reopt.1)
 
 - **Composite `(time_ms, id)` and `(time_ms, rolled_back, id)` indexes.** Once the time
   key became an 8-byte integer these became affordable in principle, so they were
