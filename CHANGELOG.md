@@ -1,5 +1,44 @@
 # Changelog
 
+## 1.3.25-reopt.3 (2026-10-07)
+
+Adds the in-game command reference the mod never had. No storage or recording changes.
+
+### Changed in this release
+
+- **`/ledger help` - the in-game command reference.** The mod shipped no help at all: the
+  root command had no executor, so `/ledger` on its own replied with Brigadier's
+  "Unknown or incomplete command", and there was no `help` subcommand to fall back on.
+  The only reference was the wiki in a browser.
+
+  Now:
+  - `/ledger` (bare)     - command list, instead of a syntax error
+  - `/ledger help`       - the same list
+  - `/ledger help <cmd>` - one command in detail: what it does, its syntax, its aliases and
+                           the permission node it checks; aliases resolve, so `help i`
+                           reaches `inspect`
+
+  Descriptions live in the language files (`text.ledger.help.*`), so they follow the
+  player's language; only `en_us` and `zh_cn` carry them and the other nine languages fall
+  back to `en_us`, which is how this mod's other messages already work.
+
+- **README rewritten** with the fork's purpose and a plain-language list of what differs
+  from upstream, in English and Chinese, pointing at the upstream wiki for command and
+  configuration documentation rather than duplicating it.
+
+### Verification (reopt.3)
+
+Live MC 26.3 Fabric server:
+
+- bare `/ledger` and `/ledger help` both render the 12-command list (previously a syntax
+  error and no help command respectively)
+- `/ledger help search` and `/ledger help preview` show purpose, usage, aliases and
+  permission node
+- `help i` resolves the alias to `inspect`
+- an unknown name reports itself instead of failing
+- `/ledger status` is unaffected
+- zero exceptions and zero tick warnings
+
 ## 1.3.25-reopt.2 (2026-10-07)
 
 Reoptimization pass over upstream Ledger 1.3.25 for MC 26.3 Fabric.
