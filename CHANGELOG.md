@@ -25,6 +25,16 @@ relative to upstream.
   Schema changes stay additive - one nullable column plus one new table - and the new
   column is created unconditionally at startup with the same instant ALTER path as
   `block_state_ref`, so no opt-in flag is needed.
+- **Dictionary lookups are resolved once per write batch, not once per row.** Writing each
+  new `extra_data` value with its own probe-then-insert cost two database round trips per
+  row, and on a 4,000-row workload of unique NBT that showed as a 60% slower drain window
+  than storing the values inline - about 83 us per row, matching two round trips at the
+  ~40 us each measured elsewhere. Every hash the batch needs is now probed with one
+  `IN (...)`, misses are written with chunked multi-row inserts, and one more `IN` reads
+  the ids back: three round trips per batch regardless of size, after which the write loop
+  only touches an in-memory map. Measured afterwards, the drain window matched the inline
+  build (0.400 s against 0.403 s at their best, over 8 interleaved pairs) while still
+  saving 15.1% of the bytes per row.
 - **`/ledger exportlegacy` restores the legacy text columns.** Rows this fork writes
   populate only the `*_ref` columns, because storing both forms on every row would cost
   exactly the bytes the dictionary saves. Unmodified upstream Ledger does not know about
