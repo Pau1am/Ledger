@@ -121,6 +121,14 @@ object HelpCommand : BuildableCommand {
 
     private fun sendDetail(ctx: Context, name: String): Int {
         val source = ctx.source
+
+        // `help help` is not worth a table row, but answering it with "unknown command"
+        // after the user just typed the word would be silly.
+        if (name.equals("help", ignoreCase = true)) {
+            sendOverview(source)
+            return 1
+        }
+
         val entry = entries.firstOrNull { it.name.equals(name, ignoreCase = true) }
             ?: entries.firstOrNull { e -> e.aliases.any { it.equals(name, ignoreCase = true) } }
 
