@@ -3,6 +3,7 @@ package com.github.quiltservertools.ledger.commands
 import com.github.quiltservertools.ledger.api.ExtensionManager
 import com.github.quiltservertools.ledger.commands.subcommands.CompactCommand
 import com.github.quiltservertools.ledger.commands.subcommands.ExportLegacyCommand
+import com.github.quiltservertools.ledger.commands.subcommands.HelpCommand
 import com.github.quiltservertools.ledger.commands.subcommands.InspectCommand
 import com.github.quiltservertools.ledger.commands.subcommands.PageCommand
 import com.github.quiltservertools.ledger.commands.subcommands.PlayerCommand
@@ -21,6 +22,13 @@ import net.minecraft.commands.Commands.literal
 fun registerCommands(dispatcher: Dispatcher) {
     val rootNode =
         literal("ledger").requires(Permissions.require("ledger.commands.root", CommandConsts.PERMISSION_LEVEL))
+            // Reoptimization: the root used to have no executor, so `/ledger` on its own
+            // answered with "Unknown or incomplete command" and there was no help command
+            // to fall back on. Bare `/ledger` now prints the command list instead.
+            .executes {
+                HelpCommand.sendOverview(it.source)
+                1
+            }
             .build()
 
     dispatcher.root.addChild(rootNode)
@@ -59,6 +67,9 @@ fun registerCommands(dispatcher: Dispatcher) {
     // Reoptimization: the reverse direction - materialise the legacy text columns so an
     // unmodified upstream build can read this database (see ExportLegacyCommand).
     rootNode.addChild(ExportLegacyCommand.build())
+
+    // Reoptimization: in-game command reference (the mod previously shipped none).
+    rootNode.addChild(HelpCommand.build())
 
     rootNode.addChild(PlayerCommand.build())
 
